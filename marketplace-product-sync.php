@@ -1733,6 +1733,9 @@ final class MPSync_Marketplace_Product_Sync {
         }
         $consumer_key_input = isset($posted['consumer_key']) ? trim((string) $posted['consumer_key']) : '';
         $consumer_secret_input = isset($posted['consumer_secret']) ? trim((string) $posted['consumer_secret']) : '';
+        if (!$existing && ('' === $consumer_key_input || '' === $consumer_secret_input)) {
+            $this->redirect('missing_credentials', $source_id);
+        }
         if (('' !== $consumer_key_input || '' !== $consumer_secret_input) && (!function_exists('openssl_encrypt') || !function_exists('openssl_decrypt') || !function_exists('random_bytes'))) {
             $this->redirect('crypto_unavailable', $source_id);
         }
