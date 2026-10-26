@@ -1,0 +1,92 @@
+t($state['status']) ? $this->state_label($state) : 'در انتظار اجرا';
+            echo '<tr><td><strong>' . esc_html(isset($source['name']) ? $source['name'] : 'بدون نام') . '</strong><br><span class="mpsync-muted">' . esc_html($id) . '</span><br><span class="mpsync-pill ' . esc_attr($status_class) . '">' . esc_html($status_text) . '</span></td>';
+            echo '<td><code>' . esc_html($this->display_endpoint($source)) . '</code><br><span class="mpsync-muted">کلیدها: ' . esc_html(!empty($source['consumer_key']) && !empty($source['consumer_secret']) && 0 === strpos($source['consumer_key'], 'enc:') && 0 === strpos($source['consumer_secret'], 'enc:') ? 'ثبت‌شده و رمزنگاری‌شده' : 'ناقص یا نیازمند بازبینی') . '</span></td>';
+            echo '<td>هر ' . esc_html((string) (isset($source['interval_hours']) ? (int) $source['interval_hours'] : 24)) . ' ساعت<br><span class="mpsync-muted">ساعت مبنا: ' . esc_html(isset($source['schedule_time']) ? $source['schedule_time'] : '03:00') . ' (' . esc_html(wp_timezone_string()) . ')</span></td>';
+            echo '<td>' . esc_html($last) . '</td><td>' . esc_html($run_text);
+            if (isset($state['created']) || isset($state['updated'])) {
+                echo '<br><span class="mpsync-muted">جدید: ' . absint(isset($state['created']) ? $state['created'] : 0) . ' · به‌روزرسانی: ' . absint(isset($state['updated']) ? $state['updated'] : 0) . ' · ردشده: ' . absint(isset($state['skipped']) ? $state['skipped'] : 0) . ' · خطا: ' . absint(isset($state['errors']) ? $state['errors'] : 0) . '</span>';
+                if (isset($state['source_total'])) {
+                    echo '<br><span class="mpsync-muted">تعداد اعلام‌شده از API: ' . absint($state['source_total']) . '</span>';
+                }
+            }
+            if (!empty($state['last_error']) && in_array($state['status'], array('failed', 'partial'), true)) {
+                echo '<br><span class="mpsync-error-text">' . esc_html($state['last_error']) . '</span>';
+            }
+            echo '</td><td><div class="mpsync-actions">';
+            echo '<a class="button" href="' . esc_url(admin_url('admin.php?page=mpsync-marketplace&tab=edit&source_id=' . rawurlencode($id))) . '">ویرایش</a>';
+            echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '">';
+            echo '<input type="hidden" name="action" value="mpsync_run_now"><input type="hidden" name="source_id" value="' . esc_attr($id) . '">';
+            wp_nonce_field('mpsync_run_now_' . $id);
+            echo '<button type="submit" class="button button-primary">همین الان اجرا کن</button></form>';
+            echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '">';
+            echo '<input type="hidden" name="action" value="mpsync_test_source"><input type="hidden" name="source_id" value="' . esc_attr($id) . '">';
+            wp_nonce_field('mpsync_test_source_' . $id);
+            echo '<button type="submit" class="button">تست API</button></form>';
+            echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" onsubmit="return confirm(\'منبع حذف شود؟ محصولات واردشده قبلی حذف نمی‌شوند.\');">';
+            echo '<input type="hidden" name="action" value="mpsync_delete_source"><input type="hidden" name="source_id" value="' . esc_attr($id) . '">';
+            wp_nonce_field('mpsync_delete_source_' . $id);
+            echo '<button type="submit" class="button mpsync-button-danger">حذف</button></form>';
+            echo '</div></td></tr>';
+        }
+        echo '</tbody></table></div>';
+        echo '<div class="mpsync-footnote"><strong>توجه:</strong> شناسه محصول در مقصد را خود ووکامرس به‌صورت یکتا می‌سازد. افزونه برای اتصال پایدار، شناسه داخلی منبع و شناسه محصول مبدأ را جداگانه ذخیره می‌کند؛ بنابراین یک شناسه یکسان در دو سایت مبدأ باعث تداخل نمی‌شود. اگر SKU تکراری باشد، SKU یکتا برای محصول واردشده تولید می‌شود.</div>';
+    }
+
+    private function display_endpoint($source) {
+        $base = isset($source['base_url']) ? $source['base_url'] : '';
+        $endpoint = isset($source['endpoint']) ? $source['endpoint'] : '';
+        if (preg_match('#^https?://#i', $endpoint)) {
+            return $endpoint;
+        }
+        return untrailingslashit($base) . '/' . ltrim($endpoint, '/');
+    }
+
+    private function state_label($state) {
+        $labels = array(
+            'running' => 'در حال اجرا… صفحه ' . absint(isset($state['page']) ? $state['page'] : 1),
+            'completed' => 'کامل شد',
+            'partial' => 'پایان با خطا',
+            'failed' => 'ناموفق',
+        );
+        $status = isset($state['status']) ? $state['status'] : '';
+        return isset($labels[$status]) ? $labels[$status] : 'در انتظار اجرا';
+    }
+
+    private function render_source_form($source = null) {
+        $is_edit = is_array($source) && !empty($source['id']);
+        if (!$is_edit) {
+            $source = array(
+                'id' => '', 'name' => '', 'base_url' => '', 'endpoint' => 'wp-json/wc/v3/products',
+                'consumer_key' => '', 'consumer_secret' => '', 'enabled' => 1, 'interval_hours' => 24,
+                'schedule_time' => '03:00', 'price_multiplier' => '1.00', 'sync_images' => 1, 'mapping' => $this->default_mapping(),
+            );
+        }
+        $mapping = isset($source['mapping']) && is_array($source['mapping']) ? $source['mapping'] : $this->default_mapping();
+        $title = $is_edit ? 'ویرایش منبع' : 'افزودن منبع جدید';
+        echo '<nav class="nav-tab-wrapper"><a class="nav-tab" href="' . esc_url(admin_url('admin.php?page=mpsync-marketplace')) . '">منابع</a><a class="nav-tab" href="' . esc_url(admin_url('admin.php?page=mpsync-marketplace&tab=logs')) . '">گزارش‌ها</a></nav>';
+        echo '<div class="mpsync-form-heading"><div><h2>' . esc_html($title) . '</h2><p>این تنظیمات فقط روی سایت مقصد ذخیره می‌شوند. کلید API مبدأ برای خواندن محصولات استفاده می‌شود.</p></div><a class="button" href="' . esc_url(admin_url('admin.php?page=mpsync-marketplace')) . '">بازگشت به منابع</a></div>';
+        echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" class="mpsync-source-form">';
+        echo '<input type="hidden" name="action" value="mpsync_save_source">';
+        echo '<input type="hidden" name="mpsync_source[id]" value="' . esc_attr($source['id']) . '">';
+        wp_nonce_field('mpsync_save_source');
+        echo '<section class="mpsync-panel"><h3>۱. اتصال به سایت مبدأ</h3><div class="mpsync-form-grid">';
+        $this->form_input('نام منبع', 'mpsync_source[name]', isset($source['name']) ? $source['name'] : '', 'مثلاً تأمین‌کننده الف', true);
+        $this->form_input('آدرس پایه سایت', 'mpsync_source[base_url]', isset($source['base_url']) ? $source['base_url'] : '', 'https://source-site.com', true, 'آدرس اصلی سایت؛ بدون مسیر API و بدون اسلش انتهایی. HTTPS توصیه می‌شود.');
+        $this->form_input('مسیر API محصولات', 'mpsync_source[endpoint]', isset($source['endpoint']) ? $source['endpoint'] : 'wp-json/wc/v3/products', 'wp-json/wc/v3/products', true, 'برای ووکامرس معمولاً همین مقدار کافی است. در صورت نیاز می‌توانید مسیر کامل API را وارد کنید.');
+        $this->form_input('Consumer Key', 'mpsync_source[consumer_key]', '', !empty($source['consumer_key']) ? 'ثبت شده؛ برای تغییر، کلید جدید وارد کنید' : 'ck_…', !$is_edit, 'کلید API با مجوز Read بسازید. اگر این فیلد را در ویرایش خالی بگذارید، مقدار قبلی حفظ می‌شود.');
+        $this->form_input('Consumer Secret', 'mpsync_source[consumer_secret]', '', !empty($source['consumer_secret']) ? 'ثبت شده؛ برای تغییر، Secret جدید وارد کنید' : 'cs_…', !$is_edit, 'Secret در صفحه نمایش داده نمی‌شود و در پایگاه داده رمزنگاری‌شده ذخیره می‌شود.');
+        echo '</div><div class="mpsync-checkbox-row"><label><input type="checkbox" name="mpsync_source[enabled]" value="1" ' . checked(!empty($source['enabled']), true, false) . '> منبع فعال باشد و خودکار اجرا شود</label><label><input type="checkbox" name="mpsync_source[sync_images]" value="1" ' . checked(!empty($source['sync_images']), true, false) . '> دانلود تصویر شاخص و گالری در مقصد</label></div>';
+        echo '</section>';
+        echo '<section class="mpsync-panel"><h3>۲. زمان‌بندی و قیمت</h3><div class="mpsync-form-grid">';
+        echo '<div class="mpsync-field"><label for="mpsync_interval">اجرا هر چند ساعت؟</label><input id="mpsync_interval" type="number" min="1" max="168" name="mpsync_source[interval_hours]" value="' . esc_attr(isset($source['interval_hours']) ? (int) $source['interval_hours'] : 24) . '" required><p class="description">مثلاً ۲۴ یعنی هر روز یک‌بار؛ مقدار مجاز ۱ تا ۱۶۸ ساعت.</p></div>';
+        echo '<div class="mpsync-field"><label for="mpsync_schedule_time">ساعت مبنا</label><input id="mpsync_schedule_time" type="time" name="mpsync_source[schedule_time]" value="' . esc_attr(isset($source['schedule_time']) ? $source['schedule_time'] : '03:00') . '" required><p class="description">زمان بر اساس منطقه زمانی وردپرس است: ' . esc_html(wp_timezone_string()) . '.</p></div>';
+        echo '<div class="mpsync-field"><label for="mpsync_price_multiplier">ضریب قیمت</label><input id="mpsync_price_multiplier" type="number" min="0.01" max="100" step="0.01" name="mpsync_source[price_multiplier]" value="' . esc_attr(isset($source['price_multiplier']) ? $source['price_multiplier'] : '1.00') . '" required><p class="description">۱ یعنی بدون تغییر؛ ۱٫۱۵ یعنی افزایش ۱۵٪ روی قیمت عادی و تخفیف محصول و وارییشن‌ها.</p></div>';
+        echo '</div><div class="mpsync-callout">زمان‌بندی خودکار به کمک Action Scheduler ووکامرس انجام می‌شود. اجرای دستی از دکمه «همین الان اجرا کن» مستقل است. اجرای زمان‌بندی‌شده به بازدید سایت هم وابستگی کامل ندارد، اما برای اجرای قابل اتکای صف‌ها بهتر است Cron هاست فعال باشد.</div></section>';
+        echo '<section class="mpsync-panel"><div class="mpsync-mapping-heading"><div><h3>۳. نگاشت کامل فیلدهای محصول</h3><p>فهرست فیلدهای رایج خروجی/ورودی CSV ووکامرس به‌همراه ویژگی‌ها، فیلدهای سفارشی و تاکسونومی‌ها در دسترس است. مسیر مبدأ از JSON API خوانده می‌شود؛ مانند <code>name</code>، <code>regular_price</code>، <code>images.0.src</code> و <code>attributes.0.options.0</code>.</p></div><button type="button" class="button button-primary" id="mpsync-add-mapping">＋ افزودن فیلد</button></div>';
+        echo '<div class="mpsync-callout"><strong>روش کار:</strong> فیلد مقصد را از فهرست انتخاب کن؛ مسیر سمت مبدأ همان مسیر JSON REST API است. برای برند ثابت، مقصد <code>taxonomy:product_brand</code>، روش «مقدار ثابت» و مقدار «نام برند» را انتخاب کن. برای فیلد سفارشی از <code>meta:your_key</code> و برای تاکسونومی اختصاصی از <code>taxonomy:your_taxonomy</code> استفاده کن. ستون ID عمداً مقصد قابل‌انتخاب نیست: وردپرس باید شناسه مقصد را بسازد؛ افزونه رابطه محصول را با شناسه منبع + شناسه مبدأ ذخیره می‌کند. نوع محصول نیز از <code>type</code> دریافتی API تعیین می‌شود. محصولات ساده، خارجی، گروهی و متغیر پردازش می‌شوند. برای اطمینان از دریافت تغییراتی که فقط در یک وارییشن رخ می‌دهد، همه والدهای متغیر در مرحله دوم بررسی می‌شوند؛ این مرحله درخواست API بیشتری نسبت به سینک صرفاً افزایشی ایجاد می‌کند.</div>';
+        echo '<datalist id="mpsync-source-paths">';
+        foreach (array('id','type','name','slug','status','featured','catalog_visibility','description','short_description','sku','global_unique_id','customs_commodity_code','customs_country_of_origin','customs_description','regular_price','sale_price','date_on_sale_from','date_on_sale_to','date_on_sale_from_gmt','date_on_sale_to_gmt','tax_status','tax_class','manage_stock','stock_quantity','low_stock_amount','stock_status','backorders','sold_individually','weight','dimensions.length','dimensions.width','dimensions.height','reviews_allowed','purchase_note','categories','categories.0.name','categories.0.slug','categories.0.parent','tags','tags.0.name','tags.0.slug','brands','brands.0.name','brands.0.slug','shipping_class','shipping_class_id','images','images.0.src','images.0.alt','downloadable','virtual','download_limit','download_expiry','downloads','downloads.0.name','downloads.0.file','downloads.0.id','attributes','attributes.0.name','attributes.0.options','attributes.0.options.0','attributes.0.visible','attributes.0.variation','external_url','button_text','upsell_ids','cross_sell_ids','grouped_products','parent_id','permalink','date_created','date_modified','date_modified_gmt','meta_data.0.key','meta_data.0.value','meta_data.my_custom_field') as $source_path) {
+            echo '<option value="' . esc_attr($source_path) . '"></option>';
+        }
+        echo '</datalist>';
+        echo '<div class="mpsync-table-wrap"><table class="widefat mpsync-mapping-table"><thead><tr><
