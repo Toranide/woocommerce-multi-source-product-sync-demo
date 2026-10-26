@@ -1,0 +1,217 @@
+(('' !== $consumer_key_input || '' !== $consumer_secret_input) && (!function_exists('openssl_encrypt') || !function_exists('openssl_decrypt') || !function_exists('random_bytes'))) {
+            $this->redirect('crypto_unavailable', $source_id);
+        }
+        $consumer_key = '' !== $consumer_key_input ? $this->encrypt_secret($consumer_key_input) : (isset($existing['consumer_key']) ? $existing['consumer_key'] : '');
+        $consumer_secret = '' !== $consumer_secret_input ? $this->encrypt_secret($consumer_secret_input) : (isset($existing['consumer_secret']) ? $existing['consumer_secret'] : '');
+        if (('' !== $consumer_key_input && '' === $consumer_key) || ('' !== $consumer_secret_input && '' === $consumer_secret)) {
+            $this->redirect('crypto_unavailable', $source_id);
+        }
+
+        $interval = isset($posted['interval_hours']) ? absint($posted['interval_hours']) : 24;
+        $interval = max(1, min(168, $interval));
+        $schedule_time = isset($posted['schedule_time']) ? sanitize_text_field($posted['schedule_time']) : '03:00';
+        if (!preg_match('/^(?:[01]\d|2[0-3]):[0-5]\d$/', $schedule_time)) {
+            $schedule_time = '03:00';
+        }
+        $price_multiplier_raw = isset($posted['price_multiplier']) ? wc_format_decimal((string) $posted['price_multiplier']) : '1';
+        $price_multiplier = is_numeric($price_multiplier_raw) ? (float) $price_multiplier_raw : 1.0;
+        $price_multiplier = max(0.01, min(100.0, $price_multiplier));
+        $mapping = array();
+        if (isset($posted['mapping']) && is_array($posted['mapping'])) {
+            foreach ($posted['mapping'] as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+                if (isset($row['target_choice'])) {
+                    $choice = trim(sanitize_text_field($row['target_choice']));
+                    $target = ('__custom__' === $choice)
+                        ? (isset($row['custom_target']) ? trim(sanitize_text_field($row['custom_target'])) : '')
+                        : $choice;
+                } else {
+                    // Backward compatibility with mappings saved by version 1.0.0.
+                    $target = isset($row['target']) ? trim(sanitize_text_field($row['target'])) : '';
+                }
+                $path = isset($row['source']) ? trim(sanitize_text_field($row['source'])) : '';
+                $mode = isset($row['mode']) && in_array($row['mode'], array('source', 'static', 'fallback'), true) ? $row['mode'] : 'source';
+                $value = isset($row['value']) ? sanitize_textarea_field($row['value']) : '';
+                if ('' === $target) {
+                    continue;
+                }
+                if (0 === strpos($target, 'meta:')) {
+                    $key = sanitize_key(substr($target, 5));
+                    $target = '' !== $key ? 'meta:' . $key : '';
+                } elseif (0 === strpos($target, 'taxonomy:')) {
+                    $taxonomy = sanitize_key(substr($target, 9));
+                    $target = '' !== $taxonomy ? 'taxonomy:' . $taxonomy : '';
+                } elseif (preg_match('/^(attribute|attribute_default|attribute_data):/i', $target)) {
+                    list($attribute_prefix, $attribute_name) = array_pad(explode(':', $target, 2), 2, '');
+                    $attribute_name = trim(sanitize_text_field($attribute_name));
+                    $target = '' !== $attribute_name ? strtolower($attribute_prefix) . ':' . $attribute_name : '';
+                } else {
+                    $target = sanitize_key($target);
+                }
+                if ('' === $target) {
+                    continue;
+                }
+                $mapping[] = array('target' => $target, 'source' => $path, 'mode' => $mode, 'value' => $value);
+            }
+        }
+        if (!$mapping) {
+            $mapping = $this->default_mapping();
+        }
+        $source = array(
+            'id' => $source_id,
+            'name' => $name,
+            'base_url' => untrailingslashit($base_url),
+            'endpoint' => $endpoint,
+            'consumer_key' => $consumer_key,
+            'consumer_secret' => $consumer_secret,
+            'enabled' => !empty($posted['enabled']) ? 1 : 0,
+            'interval_hours' => $interval,
+            'schedule_time' => $schedule_time,
+            'price_multiplier' => number_format($price_multiplier, 4, '.', ''),
+            'sync_images' => !empty($posted['sync_images']) ? 1 : 0,
+            'mapping' => $mapping,
+            'last_sync_gmt' => isset($existing['last_sync_gmt']) ? $existing['last_sync_gmt'] : '',
+            'force_full_sync' => !empty($existing['force_full_sync']) ? 1 : 0,
+        );
+        if (null === $existing_index) {
+            $sources[] = $source;
+        } else {
+            $sources[$existing_index] = $source;
+        }
+        update_option(self::OPTION_SOURCES, array_values($sources), false);
+        $this->schedule_source($source);
+        $this->add_log($source_id, 'info', 'تنظیمات منبع ذخیره شد.');
+        $this->redirect('saved', $source_id);
+    }
+
+    public function handle_delete_source() {
+        if (!self::can_manage()) {
+            wp_die('شما اجازه انجام این کار را ندارید.');
+        }
+        $source_id = isset($_POST['source_id']) ? sanitize_text_field(wp_unslash($_POST['source_id'])) : '';
+        check_admin_referer('mpsync_delete_source_' . $source_id);
+        $sources = array_values(array_filter($this->sources(), function ($source) use ($source_id) {
+            return !isset($source['id']) || (string) $source['id'] !== (string) $source_id;
+        }));
+        update_option(self::OPTION_SOURCES, $sources, false);
+        self::clear_scheduled_actions($source_id);
+        $states = $this->states();
+        unset($states[$source_id]);
+        update_option(self::OPTION_STATES, $states, false);
+        $signatures = get_option(self::OPTION_SIGS, array());
+        if (is_array($signatures)) {
+            unset($signatures[$source_id]);
+            update_option(self::OPTION_SIGS, $signatures, false);
+        }
+        $this->add_log($source_id, 'warning', 'منبع حذف شد. محصولات قبلاً واردشده در سایت مقصد حذف نمی‌شوند.');
+        $this->redirect('deleted');
+    }
+
+    public function handle_run_now() {
+        if (!self::can_manage()) {
+            wp_die('شما اجازه انجام این کار را ندارید.');
+        }
+        $source_id = isset($_POST['source_id']) ? sanitize_text_field(wp_unslash($_POST['source_id'])) : '';
+        check_admin_referer('mpsync_run_now_' . $source_id);
+        $result = $this->start_sync($source_id, 'manual');
+        if (is_wp_error($result)) {
+            $this->redirect('sync_error', $source_id);
+        }
+        $this->redirect('sync_started', $source_id);
+    }
+
+    public function handle_test_source() {
+        if (!self::can_manage()) {
+            wp_die('شما اجازه انجام این کار را ندارید.');
+        }
+        $source_id = isset($_POST['source_id']) ? sanitize_text_field(wp_unslash($_POST['source_id'])) : '';
+        check_admin_referer('mpsync_test_source_' . $source_id);
+        $source = $this->get_source($source_id);
+        if (!$source) {
+            $this->redirect('invalid_source');
+        }
+        $result = $this->request_api($this->source_for_runtime($source), array('page' => 1, 'per_page' => 1));
+        if (is_wp_error($result)) {
+            $this->add_log($source_id, 'error', 'تست API ناموفق بود: ' . $result->get_error_message());
+            $this->redirect('test_failed', $source_id);
+        }
+        $this->add_log($source_id, 'success', 'تست API موفق بود. اتصال به فهرست محصولات برقرار است.');
+        $this->redirect('test_ok', $source_id);
+    }
+
+    private function redirect($notice, $source_id = '') {
+        $url = admin_url('admin.php?page=mpsync-marketplace&notice=' . rawurlencode($notice));
+        if ('' !== (string) $source_id) {
+            $url .= '&source_id=' . rawurlencode((string) $source_id);
+        }
+        wp_safe_redirect($url);
+        exit;
+    }
+
+    public function render_admin_page() {
+        if (!self::can_manage()) {
+            wp_die('شما اجازه دسترسی به این صفحه را ندارید.');
+        }
+        echo '<div class="wrap mpsync-wrap"><h1>همگام‌سازی محصولات ووکامرس</h1>';
+        $this->render_styles();
+        $this->render_notice();
+        if (!class_exists('WooCommerce')) {
+            echo '<div class="notice notice-error"><p>WooCommerce فعال نیست. افزونه برای ساخت و به‌روزرسانی محصولات به آن نیاز دارد.</p></div></div>';
+            return;
+        }
+        $tab = isset($_GET['tab']) ? sanitize_key(wp_unslash($_GET['tab'])) : 'sources';
+        if ('edit' === $tab) {
+            $source_id = isset($_GET['source_id']) ? sanitize_text_field(wp_unslash($_GET['source_id'])) : '';
+            $source = $source_id ? $this->get_source($source_id) : null;
+            $this->render_source_form($source);
+        } elseif ('logs' === $tab) {
+            $this->render_logs();
+        } else {
+            $this->render_sources_table();
+        }
+        echo '</div>';
+    }
+
+    private function render_notice() {
+        if (empty($_GET['notice'])) {
+            return;
+        }
+        $notice = sanitize_key(wp_unslash($_GET['notice']));
+        $messages = array(
+            'saved' => array('success', 'تنظیمات منبع ذخیره شد و زمان‌بندی به‌روزرسانی شد.'),
+            'deleted' => array('success', 'منبع حذف شد. محصولات قبلی در مقصد باقی می‌مانند.'),
+            'invalid_source' => array('error', 'اطلاعات منبع معتبر نیست؛ نام، آدرس پایه و مسیر API را بررسی کنید.'),
+            'missing_credentials' => array('error', 'برای منبع جدید باید Consumer Key و Consumer Secret وارد شود.'),
+            'crypto_unavailable' => array('error', 'امکان رمزنگاری امن کلیدهای API در این سرور وجود ندارد؛ افزونه OpenSSL در PHP را بررسی کنید.'),
+            'missing_woocommerce' => array('error', 'ابتدا WooCommerce را فعال کنید.'),
+            'sync_started' => array('success', 'همگام‌سازی شروع شد. اگر محصولات زیادی وجود داشته باشد، صفحات بعدی در پس‌زمینه پردازش می‌شوند.'),
+            'sync_error' => array('error', 'همگام‌سازی آغاز نشد. ممکن است منبع در حال اجرا باشد؛ بخش وضعیت یا گزارش را بررسی کنید.'),
+            'test_ok' => array('success', 'اتصال API موفق بود.'),
+            'test_failed' => array('error', 'تست اتصال شکست خورد. گزارش‌ها را برای جزئیات بررسی کنید.'),
+        );
+        if (!isset($messages[$notice])) {
+            return;
+        }
+        echo '<div class="notice notice-' . esc_attr($messages[$notice][0]) . ' is-dismissible"><p>' . esc_html($messages[$notice][1]) . '</p></div>';
+    }
+
+    private function render_sources_table() {
+        $sources = $this->sources();
+        echo '<div class="mpsync-toolbar"><div><h2>منابع مبدأ</h2><p>برای هر سایت ووکامرسی یک منبع مستقل تعریف کنید. محصولات جدید و تغییرکرده به‌صورت خودکار شناسایی می‌شوند.</p></div>';
+        echo '<a class="button button-primary button-hero" href="' . esc_url(admin_url('admin.php?page=mpsync-marketplace&tab=edit')) . '">＋ افزودن منبع جدید</a></div>';
+        echo '<nav class="nav-tab-wrapper"><a class="nav-tab nav-tab-active" href="' . esc_url(admin_url('admin.php?page=mpsync-marketplace')) . '">منابع</a><a class="nav-tab" href="' . esc_url(admin_url('admin.php?page=mpsync-marketplace&tab=logs')) . '">گزارش‌ها</a></nav>';
+        if (!$sources) {
+            echo '<div class="mpsync-empty"><span class="dashicons dashicons-admin-site-alt3"></span><h2>هنوز منبعی تعریف نشده است</h2><p>اولین سایت مبدأ را اضافه کنید تا محصولاتش وارد این فروشگاه شود.</p><a class="button button-primary" href="' . esc_url(admin_url('admin.php?page=mpsync-marketplace&tab=edit')) . '">افزودن اولین منبع</a></div>';
+            return;
+        }
+        $states = $this->states();
+        echo '<div class="mpsync-table-wrap"><table class="widefat striped mpsync-sources"><thead><tr><th>منبع</th><th>API</th><th>زمان‌بندی</th><th>آخرین همگام‌سازی موفق</th><th>وضعیت اجرا</th><th>عملیات</th></tr></thead><tbody>';
+        foreach ($sources as $source) {
+            $id = isset($source['id']) ? (string) $source['id'] : '';
+            $state = isset($states[$id]) && is_array($states[$id]) ? $states[$id] : array();
+            $status_class = !empty($source['enabled']) ? 'mpsync-pill-on' : 'mpsync-pill-off';
+            $status_text = !empty($source['enabled']) ? 'فعال' : 'غیرفعال';
+            $last = !empty($source['last_sync_gmt']) ? get_date_from_gmt($source['last_sync_gmt'], get_option('date_format') . ' ' . get_option('time_format')) : 'هنوز اجرا نشده';
+            $run_text = isse
