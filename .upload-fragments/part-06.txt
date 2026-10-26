@@ -1,0 +1,281 @@
+t) $variation_context['parent_local_id']) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private function legacy_variation_signature($attributes) {
+        if (!is_array($attributes) || !$attributes) {
+            return '';
+        }
+        $normalized = array();
+        foreach ($attributes as $name => $value) {
+            if (is_array($value)) {
+                $value = reset($value);
+            }
+            if (!is_scalar($name) || !is_scalar($value) || '' === trim((string) $value)) {
+                continue;
+            }
+            $key = strtolower(trim((string) $name));
+            $key = preg_replace('/^attribute[_-]/', '', $key);
+            $normalized[$key] = strtolower(sanitize_title((string) $value));
+        }
+        if (!$normalized) {
+            return '';
+        }
+        ksort($normalized);
+        return md5(wp_json_encode($normalized));
+    }
+
+    private function find_imported_product($source_id, $remote_id) {
+        $ids = get_posts(array(
+            'post_type' => array('product', 'product_variation'),
+            'post_status' => array('publish', 'pending', 'draft', 'private', 'future', 'trash'),
+            'fields' => 'ids',
+            'posts_per_page' => 1,
+            'orderby' => 'ID',
+            'order' => 'ASC',
+            'meta_query' => array(
+                'relation' => 'AND',
+                array('key' => '_mpsync_source_id', 'value' => (string) $source_id, 'compare' => '='),
+                array('key' => '_mpsync_remote_product_id', 'value' => (string) $remote_id, 'compare' => '='),
+            ),
+            'suppress_filters' => true,
+        ));
+        return !empty($ids) ? absint($ids[0]) : 0;
+    }
+
+    private function make_unique_sku($desired, $source_id, $remote_id, $current_product_id = 0) {
+        $desired = is_scalar($desired) ? trim((string) $desired) : '';
+        if ('' !== $desired) {
+            $owner_id = wc_get_product_id_by_sku($desired);
+            if (!$owner_id || (int) $owner_id === (int) $current_product_id) {
+                return $desired;
+            }
+        }
+        $source_token = strtolower(substr(preg_replace('/[^a-zA-Z0-9]/', '', $source_id), 0, 8));
+        if ('' === $source_token) {
+            $source_token = 'source';
+        }
+        $base = 'mps-' . $source_token . '-' . preg_replace('/[^0-9]/', '', (string) $remote_id);
+        $base = substr($base, 0, 80);
+        $candidate = $base;
+        $suffix = 2;
+        while (($owner_id = wc_get_product_id_by_sku($candidate)) && (int) $owner_id !== (int) $current_product_id) {
+            $candidate = substr($base, 0, 70) . '-' . $suffix;
+            $suffix++;
+        }
+        return $candidate;
+    }
+
+    private function sync_product_images($product_id, $remote, $override = null) {
+        $images = (null !== $override) ? $override : (isset($remote['images']) ? $remote['images'] : array());
+        if (empty($images) && !empty($remote['image']['src'])) {
+            $images = array($remote['image']);
+        }
+        if (is_string($images)) {
+            $images = array_filter(array_map('trim', preg_split('/[|,\n]+/', $images)));
+            $images = array_map(function ($url) { return array('src' => $url); }, $images);
+        }
+        if (empty($images) || !is_array($images)) {
+            return true;
+        }
+        $urls = array();
+        foreach ($images as $image) {
+            if (is_string($image)) {
+                $image = array('src' => $image);
+            }
+            if (!empty($image['src']) && is_string($image['src'])) {
+                $url = esc_url_raw($image['src']);
+                if ($url && preg_match('#^https?://#i', $url)) {
+                    $urls[] = $url;
+                }
+            }
+        }
+        if (!$urls) {
+            return true;
+        }
+        $signature = md5(wp_json_encode($urls));
+        if (get_post_meta($product_id, '_mpsync_image_signature', true) === $signature) {
+            return true;
+        }
+        if (!function_exists('media_sideload_image')) {
+            require_once ABSPATH . 'wp-admin/includes/media.php';
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+            require_once ABSPATH . 'wp-admin/includes/image.php';
+        }
+        $attachment_ids = array();
+        foreach ($urls as $url) {
+            $existing = get_posts(array(
+                'post_type' => 'attachment',
+                'post_status' => 'inherit',
+                'fields' => 'ids',
+                'posts_per_page' => 1,
+                'meta_key' => '_mpsync_source_image_url',
+                'meta_value' => $url,
+            ));
+            if (!empty($existing[0])) {
+                $attachment_ids[] = absint($existing[0]);
+                continue;
+            }
+            $image_id = media_sideload_image($url, $product_id, isset($remote['name']) ? sanitize_text_field($remote['name']) : '', 'id');
+            if (is_wp_error($image_id)) {
+                return new WP_Error('mpsync_image_download', 'دریافت تصویر ناموفق بود (' . esc_url_raw($url) . '): ' . $image_id->get_error_message());
+            }
+            update_post_meta($image_id, '_mpsync_source_image_url', $url);
+            $attachment_ids[] = absint($image_id);
+        }
+        if ($attachment_ids) {
+            $product = wc_get_product($product_id);
+            if ($product) {
+                $product->set_image_id(array_shift($attachment_ids));
+                $product->set_gallery_image_ids(array_values($attachment_ids));
+                $product->update_meta_data('_mpsync_image_signature', $signature);
+                $product->save();
+            }
+        }
+        return true;
+    }
+
+    private function get_path_value($data, $path, &$found = false) {
+        $found = false;
+        $path = trim((string) $path);
+        if ('' === $path) {
+            return null;
+        }
+        $path = preg_replace('/\[(\d+)\]/', '.$1', $path);
+
+        // WooCommerce REST exposes meta_data as a list of {key,value} objects.
+        // Allow `meta_data.my_custom_key` to look up a value by the actual meta key,
+        // instead of relying on the unstable array index (meta_data.0.value).
+        if (is_array($data) && isset($data['meta_data']) && is_array($data['meta_data'])) {
+            $meta_parts = explode('.', $path, 2);
+            if (isset($meta_parts[0], $meta_parts[1]) && 'meta_data' === $meta_parts[0] && '' !== $meta_parts[1]) {
+                $meta_path_parts = explode('.', $meta_parts[1], 2);
+                // Keep numeric list-index paths such as meta_data.0.value on the
+                // ordinary resolver; nonnumeric paths are interpreted as meta keys.
+                if (!ctype_digit($meta_path_parts[0])) {
+                    $meta_key = $meta_parts[1];
+                    foreach ($data['meta_data'] as $meta_item) {
+                        if (is_array($meta_item) && isset($meta_item['key']) && (string) $meta_item['key'] === $meta_key && array_key_exists('value', $meta_item)) {
+                            $found = true;
+                            return $meta_item['value'];
+                        }
+                    }
+                    return null;
+                }
+            }
+        }
+
+        $parts = explode('.', $path);
+        $value = $data;
+        foreach ($parts as $part) {
+            if (is_array($value) && array_key_exists($part, $value)) {
+                $value = $value[$part];
+            } elseif (is_object($value) && isset($value->{$part})) {
+                $value = $value->{$part};
+            } else {
+                return null;
+            }
+        }
+        $found = true;
+        return $value;
+    }
+
+    private function normalize_terms($value) {
+        if (is_array($value)) {
+            $terms = array();
+            foreach ($value as $item) {
+                if (is_array($item)) {
+                    if (isset($item['name'])) {
+                        $terms[] = sanitize_text_field($item['name']);
+                    } elseif (isset($item['slug'])) {
+                        $terms[] = sanitize_text_field($item['slug']);
+                    }
+                } elseif (is_scalar($item)) {
+                    $terms[] = sanitize_text_field((string) $item);
+                }
+            }
+            return array_values(array_unique(array_filter($terms, 'strlen')));
+        }
+        if (!is_scalar($value)) {
+            return array();
+        }
+        $terms = array_map('trim', explode(',', (string) $value));
+        return array_values(array_unique(array_filter(array_map('sanitize_text_field', $terms), 'strlen')));
+    }
+
+    private function to_bool($value) {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_numeric($value)) {
+            return (bool) $value;
+        }
+        return in_array(strtolower(trim((string) $value)), array('1', 'yes', 'true', 'on', 'بله'), true);
+    }
+
+    private function supported_product_fields() {
+        return array(
+            'name', 'slug', 'description', 'short_description', 'sku', 'status', 'featured',
+            'catalog_visibility', 'virtual', 'downloadable', 'regular_price', 'sale_price',
+            'date_on_sale_from', 'date_on_sale_to', 'tax_status', 'tax_class', 'manage_stock',
+            'stock_quantity', 'low_stock_amount', 'stock_status', 'backorders', 'sold_individually',
+            'weight', 'length', 'width', 'height', 'purchase_note', 'reviews_allowed', 'menu_order',
+            'global_unique_id', 'customs_commodity_code', 'customs_country_of_origin', 'customs_description',
+            'download_limit', 'download_expiry', 'downloads', 'attributes',
+            'product_url', 'button_text', 'upsell_ids', 'cross_sell_ids', 'children', 'parent_id',
+            'shipping_class',
+        );
+    }
+
+    /**
+     * Common WooCommerce CSV importer/exporter fields plus extension points for
+     * taxonomy, meta, and product-attribute mappings.
+     */
+    private function mapping_field_options() {
+        return array(
+            'مشخصات اصلی (ستون‌های استاندارد CSV ووکامرس)' => array(
+                'name' => 'Name — نام محصول',
+                'slug' => 'Slug — نامک',
+                'status' => 'Published / Status — وضعیت انتشار',
+                'featured' => 'Is featured? — محصول ویژه',
+                'catalog_visibility' => 'Visibility in catalog — نمایش در کاتالوگ',
+                'sku' => 'SKU — شناسه کالا',
+                'global_unique_id' => 'GTIN, UPC, EAN, or ISBN — شناسه جهانی کالا',
+                'customs_commodity_code' => 'Customs commodity code — کد گمرکی کالا (در نسخه‌های پشتیبان)',
+                'customs_country_of_origin' => 'Country of origin — کشور مبدأ (کد دوحرفی ISO)',
+                'customs_description' => 'Customs description — توضیحات گمرکی',
+                'menu_order' => 'Position — ترتیب نمایش',
+                'reviews_allowed' => 'Allow customer reviews? — اجازه ثبت دیدگاه',
+                'purchase_note' => 'Purchase note — یادداشت خرید',
+            ),
+            'توضیحات، قیمت و مالیات' => array(
+                'short_description' => 'Short description — توضیح کوتاه',
+                'description' => 'Description — توضیحات کامل',
+                'regular_price' => 'Regular price — قیمت عادی',
+                'sale_price' => 'Sale price — قیمت فروش ویژه',
+                'date_on_sale_from' => 'Date sale price starts — شروع تخفیف',
+                'date_on_sale_to' => 'Date sale price ends — پایان تخفیف',
+                'tax_status' => 'Tax status — وضعیت مالیات',
+                'tax_class' => 'Tax class — کلاس مالیاتی',
+            ),
+            'موجودی و انبار' => array(
+                'manage_stock' => 'Manage stock? — مدیریت موجودی',
+                'stock_quantity' => 'Stock — تعداد موجودی',
+                'low_stock_amount' => 'Low stock amount — آستانه کمبود موجودی',
+                'stock_status' => 'In stock? / Stock status — وضعیت موجودی',
+                'backorders' => 'Backorders allowed? — پیش‌فروش در نبود موجودی',
+                'sold_individually' => 'Sold individually? — فروش تکی',
+            ),
+            'ابعاد و ارسال' => array(
+                'weight' => 'Weight — وزن',
+                'length' => 'Length — طول',
+                'width' => 'Width — عرض',
+                'height' => 'Height — ارتفاع',
+                'shipping_class' => 'Shipping class — کلاس حمل‌ونقل',
+            ),
+            'دسته‌بندی، برچسب و برند' => array(
+                'taxonomy:product_cat' => 'Categories — دسته‌بندی‌ها',
+              
