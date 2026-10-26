@@ -1,0 +1,95 @@
+th>فیلد مقصد (مشابه ووکامرس)</th><th>مسیر فیلد مبدأ / JSON</th><th>روش مقداردهی</th><th>مقدار ثابت / پیش‌فرض</th><th></th></tr></thead><tbody id="mpsync-mapping-rows">';
+        foreach ($mapping as $index => $row) {
+            $this->render_mapping_row($index, $row);
+        }
+        echo '</tbody></table></div>';
+        echo '<template id="mpsync-map-template">';
+        $this->render_mapping_row('__INDEX__', array('target' => '', 'source' => '', 'mode' => 'source', 'value' => ''));
+        echo '</template>';
+        echo '<div class="mpsync-callout"><strong>روش «مبدأ؛ وگرنه پیش‌فرض»:</strong> اگر مسیر مبدأ خالی، ناموجود یا یک آرایه خالی باشد، مقدار پیش‌فرض استفاده می‌شود. برای ویژگی سفارشی از مقصد <code>attribute:Color</code> و مسیر مبدأ <code>attributes.0.options</code> استفاده کن؛ برای پیش‌فرض همان ویژگی مقصد <code>attribute_default:Color</code> را انتخاب کن. تنظیمات ویژگی به صورت <code>position|visible|variation|global</code> وارد می‌شوند، مثلاً <code>0|1|0|1</code>. برای مقادیر تاکسونومی، نام ترم مبدأ/ثابت در سایت مقصد پیدا یا ایجاد می‌شود؛ شناسه عددی ترم از سایت مبدأ به مقصد منتقل نمی‌شود.</div>';
+        echo '</section><div class="mpsync-submit-row"><button type="submit" class="button button-primary button-hero">ذخیره منبع</button><a class="button button-large" href="' . esc_url(admin_url('admin.php?page=mpsync-marketplace')) . '">انصراف</a></div></form>';
+        echo '<script>(function(){var add=document.getElementById("mpsync-add-mapping");var body=document.getElementById("mpsync-mapping-rows");var template=document.getElementById("mpsync-map-template");if(!add||!body||!template)return;function toggleCustom(row){var select=row.querySelector(".mpsync-target-choice");var custom=row.querySelector(".mpsync-custom-target");if(select&&custom){custom.style.display=select.value==="__custom__"?"block":"none";}}body.querySelectorAll("tr").forEach(toggleCustom);body.addEventListener("change",function(e){if(e.target.matches(".mpsync-target-choice"))toggleCustom(e.target.closest("tr"));});add.addEventListener("click",function(){var index=Date.now().toString()+Math.floor(Math.random()*1000);var html=template.innerHTML.replace(/__INDEX__/g,index);var wrapper=document.createElement("tbody");wrapper.innerHTML=html.trim();if(wrapper.firstElementChild){body.appendChild(wrapper.firstElementChild);toggleCustom(wrapper.firstElementChild);}});body.addEventListener("click",function(e){var button=e.target.closest(".mpsync-remove-row");if(button){e.preventDefault();var row=button.closest("tr");if(row)row.remove();}});})();</script>';
+    }
+
+    private function form_input($label, $name, $value, $placeholder = '', $required = false, $description = '') {
+        $id = 'mpsync-' . sanitize_key(str_replace(array('[', ']'), '-', $name));
+        echo '<div class="mpsync-field"><label for="' . esc_attr($id) . '">' . esc_html($label) . ($required ? ' <span class="required">*</span>' : '') . '</label>';
+        echo '<input id="' . esc_attr($id) . '" type="text" name="' . esc_attr($name) . '" value="' . esc_attr($value) . '" placeholder="' . esc_attr($placeholder) . '" ' . ($required ? 'required' : '') . '>';
+        if ($description) {
+            echo '<p class="description">' . esc_html($description) . '</p>';
+        }
+        echo '</div>';
+    }
+
+    private function render_mapping_row($index, $row) {
+        $target = isset($row['target']) ? (string) $row['target'] : '';
+        $source = isset($row['source']) ? (string) $row['source'] : '';
+        $mode = isset($row['mode']) ? $row['mode'] : 'source';
+        $value = isset($row['value']) ? $row['value'] : '';
+        $options = $this->mapping_field_options();
+        $template_targets = array('meta:my_custom_field', 'taxonomy:my_taxonomy', 'attribute:NAME', 'attribute_default:NAME', 'attribute_data:NAME');
+        $is_known = false;
+        if (!in_array($target, $template_targets, true)) {
+            foreach ($options as $group_options) {
+                if (array_key_exists($target, $group_options)) {
+                    $is_known = true;
+                    break;
+                }
+            }
+        }
+        $select_value = $is_known ? $target : '__custom__';
+        $custom_value = $is_known ? '' : $target;
+        $i = esc_attr((string) $index);
+        echo '<tr><td class="mpsync-target-cell"><select class="mpsync-target-choice" name="mpsync_source[mapping][' . $i . '][target_choice]" aria-label="فیلد مقصد">';
+        foreach ($options as $group => $group_options) {
+            echo '<optgroup label="' . esc_attr($group) . '">';
+            foreach ($group_options as $option_value => $option_label) {
+                echo '<option value="' . esc_attr($option_value) . '" ' . selected($select_value, $option_value, false) . '>' . esc_html($option_label) . '</option>';
+            }
+            echo '</optgroup>';
+        }
+        echo '<option value="__custom__" ' . selected($select_value, '__custom__', false) . '>فیلد یا تاکسونومی دلخواه…</option>';
+        echo '</select><input class="mpsync-custom-target" type="text" name="mpsync_source[mapping][' . $i . '][custom_target]" value="' . esc_attr($custom_value) . '" placeholder="meta:my_key یا taxonomy:my_taxonomy" aria-label="فیلد مقصد دلخواه" style="margin-top:6px;width:100%;' . ($is_known ? 'display:none;' : '') . '"></td>';
+        echo '<td><input type="text" list="mpsync-source-paths" dir="ltr" name="mpsync_source[mapping][' . $i . '][source]" value="' . esc_attr($source) . '" placeholder="name / regular_price" aria-label="مسیر مبدأ"></td>';
+        echo '<td><select name="mpsync_source[mapping][' . $i . '][mode]" aria-label="روش مقداردهی">';
+        echo '<option value="source" ' . selected($mode, 'source', false) . '>از مبدأ</option>';
+        echo '<option value="static" ' . selected($mode, 'static', false) . '>مقدار ثابت</option>';
+        echo '<option value="fallback" ' . selected($mode, 'fallback', false) . '>مبدأ؛ وگرنه پیش‌فرض</option>';
+        echo '</select></td>';
+        echo '<td><textarea name="mpsync_source[mapping][' . $i . '][value]" rows="2" placeholder="مقدار ثابت یا پیش‌فرض" aria-label="مقدار ثابت یا پیش‌فرض">' . esc_textarea($value) . '</textarea></td>';
+        echo '<td><button type="button" class="button mpsync-remove-row" aria-label="حذف نگاشت">حذف</button></td></tr>';
+    }
+
+    private function render_logs() {
+        echo '<nav class="nav-tab-wrapper"><a class="nav-tab" href="' . esc_url(admin_url('admin.php?page=mpsync-marketplace')) . '">منابع</a><a class="nav-tab nav-tab-active" href="' . esc_url(admin_url('admin.php?page=mpsync-marketplace&tab=logs')) . '">گزارش‌ها</a></nav>';
+        $logs = get_option(self::OPTION_LOGS, array());
+        if (!is_array($logs)) {
+            $logs = array();
+        }
+        echo '<div class="mpsync-form-heading"><div><h2>گزارش اجرای همگام‌سازی</h2><p>آخرین ۱۵۰ رویداد ذخیره می‌شود.</p></div></div>';
+        echo '<div class="mpsync-table-wrap"><table class="widefat striped"><thead><tr><th>زمان</th><th>منبع</th><th>سطح</th><th>پیام</th></tr></thead><tbody>';
+        if (!$logs) {
+            echo '<tr><td colspan="4">هنوز گزارشی ثبت نشده است.</td></tr>';
+        } else {
+            foreach ($logs as $log) {
+                $time = !empty($log['time_gmt']) ? get_date_from_gmt($log['time_gmt'], get_option('date_format') . ' ' . get_option('time_format')) : '—';
+                $level = isset($log['level']) ? $log['level'] : 'info';
+                echo '<tr><td>' . esc_html($time) . '</td><td>' . esc_html(isset($log['source_name']) ? $log['source_name'] : '') . '</td><td><span class="mpsync-pill mpsync-level-' . esc_attr($level) . '">' . esc_html($this->log_level_label($level)) . '</span></td><td>' . esc_html(isset($log['message']) ? $log['message'] : '') . '</td></tr>';
+            }
+        }
+        echo '</tbody></table></div>';
+    }
+
+    private function log_level_label($level) {
+        $labels = array('info' => 'اطلاعات', 'success' => 'موفق', 'warning' => 'هشدار', 'error' => 'خطا');
+        return isset($labels[$level]) ? $labels[$level] : 'اطلاعات';
+    }
+
+    private function render_styles() {
+        echo '<style>
+        .mpsync-wrap{direction:rtl;color:#1d2939}.mpsync-wrap h1{font-size:25px;margin-bottom:22px}.mpsync-toolbar,.mpsync-form-heading,.mpsync-mapping-heading{display:flex;align-items:center;justify-content:space-between;gap:18px;flex-wrap:wrap;margin:24px 0 16px}.mpsync-toolbar h2,.mpsync-form-heading h2,.mpsync-panel h3{margin:0 0 8px}.mpsync-toolbar p,.mpsync-form-heading p,.mpsync-mapping-heading p{margin:0;color:#667085}.mpsync-table-wrap{overflow-x:auto;background:#fff;border:1px solid #dfe3e8;border-radius:8px;margin-top:18px}.mpsync-wrap table{border:0}.mpsync-sources td,.mpsync-sources th{padding:13px 12px;vertical-align:top}.mpsync-sources code{direction:ltr;display:inline-block;max-width:260px;overflow-wrap:anywhere;white-space:normal}.mpsync-muted{font-size:11px;color:#667085}.mpsync-pill{display:inline-block;border-radius:20px;padding:3px 9px;font-size:11px;font-weight:600;margin-top:5px;background:#eef2f6;color:#475467}.mpsync-pill-on,.mpsync-level-success{background:#dcfae6;color:#067647}.mpsync-pill-off{background:#f2f4f7;color:#475467}.mpsync-level-error{background:#fee4e2;color:#b42318}.mpsync-level-warning{background:#fef0c7;color:#93370d}.mpsync-actions{display:flex;gap:6px;flex-wrap:wrap;min-width:240px}.mpsync-actions form{margin:0}.mpsync-button-danger{color:#b42318!important;border-color:#fda29b!important}.mpsync-error-text{display:inline-block;max-width:270px;color:#b42318;font-size:11px;overflow-wrap:anywhere;margin-top:5px}.mpsync-footnote,.mpsync-callout{background:#f8fafc;border:1px solid #e4e7ec;border-right:4px solid #84adff;padding:13px 16px;margin-top:18px;border-radius:6px;line-height:1.9;color:#475467}.mpsync-empty{text-align:center;background:#fff;border:1px dashed #cbd5e1;border-radius:12px;padding:50px 20px;margin-top:24px}.mpsync-empty .dashicons{font-size:38px;width:38px;height:38px;color:#64748b}.mpsync-empty p{color:#667085}.mpsync-panel{background:#fff;border:1px solid #dfe3e8;border-radius:10px;padding:24px;margin:18px 0}.mpsync-panel h3{font-size:16px;padding-bottom:14px;border-bottom:1px solid #eaecf0}.mpsync-form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px 24px;margin-top:20px}.mpsync-field{min-width:0}.mpsync-field label{display:block;font-weight:600;margin-bottom:7px}.mpsync-field .required{color:#d92d20}.mpsync-field input[type=text],.mpsync-field input[type=number],.mpsync-field input[type=time]{width:100%;max-width:none;min-height:40px;border-color:#d0d5dd;border-radius:6px;direction:ltr;text-align:left;padding:6px 10px}.mpsync-field input[name="mpsync_source[name]"]{direction:rtl;text-align:right}.mpsync-field .description{color:#667085;line-height:1.7;margin:6px 0 0}.mpsync-checkbox-row{display:flex;gap:24px;flex-wrap:wrap;margin-top:24px;padding-top:18px;border-top:1px solid #eaecf0}.mpsync-checkbox-row label{display:flex;gap:8px;align-items:center}.mpsync-checkbox-row input{margin:0}.mpsync-mapping-table{min-width:850px}.mpsync-mapping-table th,.mpsync-mapping-table td{padding:8px;vertical-align:middle}.mpsync-mapping-table input,.mpsync-mapping-table select,.mpsync-mapping-table textarea{width:100%;max-width:none;box-sizing:border-box}.mpsync-mapping-table input,.mpsync-mapping-table select{min-height:36px}.mpsync-mapping-table textarea{min-height:46px;resize:vertical}.mpsync-mapping-table td:first-child{min-width:180px}.mpsync-mapping-table td:nth-child(2){min-width:190px}.mpsync-mapping-table td:nth-child(3){min-width:155px}.mpsync-mapping-table td:nth-child(4){min-width:230px}.mpsync-mapping-table td:last-child{min-width:60px}.mpsync-mapping-heading{margin:0 0 10px}.mpsync-mapping-heading h3{border:0;padding:0}.mpsync-mapping-heading p{margin-top:7px}.mpsync-callout code{direction:ltr;unicode-bidi:isolate}.mpsync-submit-row{display:flex;gap:10px;align-items:center;margin:24px 0}.mpsync-source-form .button-hero{padding:0 24px}.mpsync-wrap .nav-tab-wrapper{margin-top:20px}.mpsync-wrap input,.mpsync-wrap textarea,.mpsync-wrap select{box-shadow:none}.mpsync-wrap input:focus,.mpsync-wrap textarea:focus,.mpsync-wrap select:focus{border-color:#2271b1;box-shadow:0 0 0 1px #2271b1;outline:0}@media(max-width:782px){.mpsync-form-grid{grid-template-columns:1fr}.mpsync-panel{padding:16px}.mpsync-actions{min-width:230px}.mpsync-toolbar .button-hero{width:100%;text-align:center}.mpsync-submit-row{flex-wrap:wrap}}
+        </style>';
+    }
+}
+
+MPSync_Marketplace_Product_Sync::instance();
