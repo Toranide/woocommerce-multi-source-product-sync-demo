@@ -1,0 +1,37 @@
+name: Assemble plugin source
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.upload-fragments/**'
+permissions:
+  contents: write
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Assemble source when every chunk is present
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=10
+          actual=$(find .upload-fragments -maxdepth 1 -type f -name 'part-*.txt' 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$actual" -ne "$expected" ]; then
+            echo "Source upload is incomplete ($actual/$expected chunks); nothing to do."
+            exit 0
+          fi
+          cat .upload-fragments/part-*.txt > marketplace-product-sync.php
+          if command -v php >/dev/null 2>&1; then
+            php -l marketplace-product-sync.php
+          fi
+          rm -rf .upload-fragments
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A .upload-fragments marketplace-product-sync.php
+          git commit -m "Add free plugin source v1.4.4"
+          git push origin HEAD:main
