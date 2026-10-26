@@ -1,0 +1,310 @@
+<?php
+/**
+ * Plugin Name: همگام‌ساز چندمنبعی محصولات ووکامرس
+ * Description: همگام‌سازی خودکار محصولات بین چند فروشگاه ووکامرس با نگاشت فیلدها، مقادیر ثابت و پیش‌فرض، زمان‌بندی و اجرای دستی.
+ * Version:     1.4.4
+ * Author:      Toranide
+ * License:     GPL-2.0-or-later
+ * License URI: https://www.gnu.org/licenses/gpl-2.0.html
+ * Requires at least: 6.2
+ * Requires PHP: 7.4
+ * WC requires at least: 7.0
+ * Text Domain: marketplace-product-sync
+ */
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+final class MPSync_Marketplace_Product_Sync {
+    const VERSION = '1.4.4';
+    const OPTION_SOURCES = 'mpsync_sources_v1';
+    const OPTION_STATES  = 'mpsync_states_v1';
+    const OPTION_LOGS    = 'mpsync_logs_v1';
+    const OPTION_SIGS    = 'mpsync_schedule_signatures_v1';
+    const GROUP_PREFIX   = 'mpsync-source-';
+    const SCHEDULE_HOOK  = 'mpsync_scheduled_run';
+    const PAGE_HOOK      = 'mpsync_process_sync_page';
+    const PER_PAGE       = 25;
+
+    private static $instance = null;
+
+    public static function instance() {
+        if (null === self::$instance) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+
+    private function __construct() {
+        add_action('admin_menu', array($this, 'register_admin_menu'));
+        add_action('admin_notices', array($this, 'dependency_notice'));
+        add_action('admin_init', array($this, 'maybe_upgrade_full_mapping'), 39);
+        add_action('admin_init', array($this, 'maybe_upgrade_include_all_products_v14'), 40);
+        add_action('admin_init', array($this, 'ensure_schedules'), 41);
+        add_action('admin_post_mpsync_save_source', array($this, 'handle_save_source'));
+        add_action('admin_post_mpsync_delete_source', array($this, 'handle_delete_source'));
+        add_action('admin_post_mpsync_run_now', array($this, 'handle_run_now'));
+        add_action('admin_post_mpsync_test_source', array($this, 'handle_test_source'));
+        add_action(self::SCHEDULE_HOOK, array($this, 'handle_scheduled_run'), 10, 1);
+        add_action(self::PAGE_HOOK, array($this, 'handle_page_job'), 10, 2);
+        register_activation_hook(__FILE__, array(__CLASS__, 'activate'));
+        register_deactivation_hook(__FILE__, array(__CLASS__, 'deactivate'));
+    }
+
+    public static function activate() {
+        if (false === get_option(self::OPTION_SOURCES, false)) {
+            add_option(self::OPTION_SOURCES, array(), '', false);
+        }
+        if (false === get_option(self::OPTION_STATES, false)) {
+            add_option(self::OPTION_STATES, array(), '', false);
+        }
+        if (false === get_option(self::OPTION_LOGS, false)) {
+            add_option(self::OPTION_LOGS, array(), '', false);
+        }
+    }
+
+    public static function deactivate() {
+        $sources = get_option(self::OPTION_SOURCES, array());
+        if (is_array($sources)) {
+            foreach ($sources as $source) {
+                if (!empty($source['id'])) {
+                    self::clear_scheduled_actions($source['id']);
+                }
+            }
+        }
+
+        // Clear the saved signatures as well. Otherwise, after reactivation,
+        // ensure_schedules() could believe the old jobs still exist and skip
+        // recreating the recurring source jobs that deactivation removed.
+        delete_option(self::OPTION_SIGS);
+    }
+
+    private static function can_manage() {
+        return current_user_can('manage_woocommerce') || current_user_can('manage_options');
+    }
+
+    public function register_admin_menu() {
+        add_menu_page(
+            'همگام‌ساز محصولات',
+            'همگام‌ساز محصولات',
+            'manage_woocommerce',
+            'mpsync-marketplace',
+            array($this, 'render_admin_page'),
+            'dashicons-update',
+            56
+        );
+    }
+
+    public function dependency_notice() {
+        if (!self::can_manage() || class_exists('WooCommerce')) {
+            return;
+        }
+        echo '<div class="notice notice-error"><p><strong>همگام‌ساز چندمنبعی محصولات ووکامرس:</strong> برای استفاده از این افزونه، ابتدا WooCommerce را نصب و فعال کنید.</p></div>';
+    }
+
+    private function sources() {
+        $sources = get_option(self::OPTION_SOURCES, array());
+        return is_array($sources) ? $sources : array();
+    }
+
+    private function states() {
+        $states = get_option(self::OPTION_STATES, array());
+        return is_array($states) ? $states : array();
+    }
+
+    private function get_source($source_id) {
+        foreach ($this->sources() as $source) {
+            if (isset($source['id']) && hash_equals((string) $source['id'], (string) $source_id)) {
+                return $source;
+            }
+        }
+        return null;
+    }
+
+    private function source_for_runtime($source) {
+        if (!is_array($source)) {
+            return $source;
+        }
+        $source['consumer_key']    = $this->decrypt_secret(isset($source['consumer_key']) ? $source['consumer_key'] : '');
+        $source['consumer_secret'] = $this->decrypt_secret(isset($source['consumer_secret']) ? $source['consumer_secret'] : '');
+        return $source;
+    }
+
+    private function source_group($source_id) {
+        return self::GROUP_PREFIX . substr(preg_replace('/[^a-zA-Z0-9]/', '', (string) $source_id), 0, 32);
+    }
+
+    private static function clear_scheduled_run_actions($source_id) {
+        $group = self::GROUP_PREFIX . substr(preg_replace('/[^a-zA-Z0-9]/', '', (string) $source_id), 0, 32);
+        if (function_exists('as_unschedule_all_actions')) {
+            as_unschedule_all_actions(self::SCHEDULE_HOOK, array((string) $source_id), $group);
+        }
+        wp_clear_scheduled_hook(self::SCHEDULE_HOOK, array((string) $source_id));
+    }
+
+    private static function clear_scheduled_actions($source_id) {
+        self::clear_scheduled_run_actions($source_id);
+        $group = self::GROUP_PREFIX . substr(preg_replace('/[^a-zA-Z0-9]/', '', (string) $source_id), 0, 32);
+        if (function_exists('as_unschedule_all_actions')) {
+            as_unschedule_all_actions(self::PAGE_HOOK, null, $group);
+        }
+        wp_clear_scheduled_hook(self::PAGE_HOOK, array((string) $source_id));
+    }
+
+    /**
+     * One-time upgrade for sources created by earlier builds: append missing
+     * WooCommerce product fields so existing configurations gain the full catalog
+     * without deleting the user's current custom mappings.
+     */
+    public function maybe_upgrade_full_mapping() {
+        if (get_option('mpsync_full_mapping_migrated_v12')) {
+            return;
+        }
+        $sources = $this->sources();
+        $defaults = $this->default_mapping();
+        foreach ($sources as &$source) {
+            $mapping = isset($source['mapping']) && is_array($source['mapping']) ? $source['mapping'] : array();
+            $present = array();
+            foreach ($mapping as $row) {
+                if (is_array($row) && !empty($row['target'])) {
+                    $present[(string) $row['target']] = true;
+                }
+            }
+            foreach ($defaults as $row) {
+                if (empty($present[$row['target']])) {
+                    $mapping[] = $row;
+                    $present[$row['target']] = true;
+                }
+            }
+            $source['mapping'] = $mapping;
+        }
+        unset($source);
+        if ($sources) {
+            update_option(self::OPTION_SOURCES, array_values($sources), false);
+        }
+        update_option('mpsync_full_mapping_migrated_v12', 1, false);
+    }
+
+    /**
+     * One-time migration: include every readable product status and force one full
+     * reconciliation so products previously hidden by the API's default status
+     * filter can be backfilled without deleting the existing destination products.
+     */
+    public function maybe_upgrade_include_all_products_v14() {
+        if (get_option('mpsync_v14_all_status_backfill_done')) {
+            return;
+        }
+        $sources = $this->sources();
+        foreach ($sources as &$source) {
+            if (!empty($source['id'])) {
+                $source['force_full_sync'] = 1;
+            }
+        }
+        unset($source);
+        if ($sources) {
+            update_option(self::OPTION_SOURCES, array_values($sources), false);
+        }
+        update_option('mpsync_v14_all_status_backfill_done', 1, false);
+    }
+
+    public function ensure_schedules() {
+        if (!function_exists('as_schedule_single_action') && !function_exists('wp_schedule_single_event')) {
+            return;
+        }
+        $sources = $this->sources();
+        $signatures = get_option(self::OPTION_SIGS, array());
+        if (!is_array($signatures)) {
+            $signatures = array();
+        }
+        $active_ids = array();
+        foreach ($sources as $source) {
+            if (empty($source['id'])) {
+                continue;
+            }
+            $id = (string) $source['id'];
+            $active_ids[] = $id;
+            $signature = md5(wp_json_encode(array(
+                'enabled' => !empty($source['enabled']),
+                'interval_hours' => isset($source['interval_hours']) ? (int) $source['interval_hours'] : 24,
+                'schedule_time' => isset($source['schedule_time']) ? $source['schedule_time'] : '03:00',
+            )));
+            if (!isset($signatures[$id]) || $signatures[$id] !== $signature) {
+                $this->schedule_source($source);
+                $signatures[$id] = $signature;
+            }
+        }
+        foreach (array_keys($signatures) as $old_id) {
+            if (!in_array((string) $old_id, $active_ids, true)) {
+                self::clear_scheduled_actions($old_id);
+                unset($signatures[$old_id]);
+            }
+        }
+        update_option(self::OPTION_SIGS, $signatures, false);
+    }
+
+    private function schedule_source($source) {
+        if (empty($source['id'])) {
+            return;
+        }
+        $id = (string) $source['id'];
+        self::clear_scheduled_run_actions($id);
+        if (empty($source['enabled'])) {
+            $signatures = get_option(self::OPTION_SIGS, array());
+            if (is_array($signatures)) {
+                $signatures[$id] = md5(wp_json_encode(array('enabled' => false)));
+                update_option(self::OPTION_SIGS, $signatures, false);
+            }
+            return;
+        }
+        $timestamp = $this->next_run_timestamp($source);
+        $group = $this->source_group($id);
+        if (function_exists('as_schedule_single_action')) {
+            as_schedule_single_action($timestamp, self::SCHEDULE_HOOK, array($id), $group, false);
+        } else {
+            wp_schedule_single_event($timestamp, self::SCHEDULE_HOOK, array($id));
+        }
+        $signatures = get_option(self::OPTION_SIGS, array());
+        if (!is_array($signatures)) {
+            $signatures = array();
+        }
+        $signatures[$id] = md5(wp_json_encode(array(
+            'enabled' => true,
+            'interval_hours' => isset($source['interval_hours']) ? (int) $source['interval_hours'] : 24,
+            'schedule_time' => isset($source['schedule_time']) ? $source['schedule_time'] : '03:00',
+        )));
+        update_option(self::OPTION_SIGS, $signatures, false);
+    }
+
+    private function next_run_timestamp($source) {
+        $timezone = wp_timezone();
+        $now = new DateTimeImmutable('now', $timezone);
+        $time = isset($source['schedule_time']) && preg_match('/^(?:[01]\d|2[0-3]):[0-5]\d$/', $source['schedule_time'])
+            ? $source['schedule_time'] : '03:00';
+        list($hour, $minute) = array_map('intval', explode(':', $time));
+        $candidate = $now->setTime($hour, $minute, 0);
+        $interval = max(1, min(168, isset($source['interval_hours']) ? (int) $source['interval_hours'] : 24));
+        if (24 === $interval) {
+            if ($candidate <= $now) {
+                $candidate = $candidate->modify('+1 day');
+            }
+        } else {
+            while ($candidate <= $now) {
+                $candidate = $candidate->modify('+' . $interval . ' hours');
+            }
+        }
+        return $candidate->getTimestamp();
+    }
+
+    public function handle_scheduled_run($source_id) {
+        $source = $this->get_source($source_id);
+        if (!$source || empty($source['enabled'])) {
+            return;
+        }
+        // Plan the next occurrence first; the sync itself may take several queued page jobs.
+        $this->schedule_next_occurrence($source);
+        $this->start_sync((string) $source_id, 'scheduled');
+    }
+
+    private function schedule_next_occurrence($source) {
+        $id = (string) $so
