@@ -24,7 +24,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected=12
+          expected=13
           mapfile -t chunks < <(find .release-payload -maxdepth 1 -type f -name 'part-*.b64' 2>/dev/null | sort)
           actual="${#chunks[@]}"
           if [ "$actual" -ne "$expected" ]; then
@@ -55,7 +55,7 @@ jobs:
           git push origin HEAD:main
       - name: Publish GitHub Release
         if: steps.package.outputs.ready == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v1.4.4
           target_commitish: main
