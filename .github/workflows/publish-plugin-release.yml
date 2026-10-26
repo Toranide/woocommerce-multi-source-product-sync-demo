@@ -1,0 +1,69 @@
+name: Publish plugin release
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.release-payload/**'
+permissions:
+  contents: write
+concurrency:
+  group: publish-plugin-release-v1-4-4
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Wait until every package chunk has arrived and validate package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=12
+          mapfile -t chunks < <(find .release-payload -maxdepth 1 -type f -name 'part-*.b64' 2>/dev/null | sort)
+          actual="${#chunks[@]}"
+          if [ "$actual" -ne "$expected" ]; then
+            echo "Package upload is incomplete ($actual/$expected chunks); nothing to do."
+            exit 0
+          fi
+          cat "${chunks[@]}" | tr -d '\r\n ' | base64 --decode > /tmp/plugin-package.zip
+          unzip -t /tmp/plugin-package.zip
+          mkdir -p dist
+          cp /tmp/plugin-package.zip dist/woocommerce-multi-source-product-sync-1.4.4.zip
+          unzip -p /tmp/plugin-package.zip woocommerce-multi-source-product-sync/marketplace-product-sync.php > /tmp/marketplace-product-sync.php
+          grep -q 'Version:     1.4.4' /tmp/marketplace-product-sync.php
+          grep -q 'if (!$existing &&' /tmp/marketplace-product-sync.php
+          php -l /tmp/marketplace-product-sync.php
+          cp /tmp/marketplace-product-sync.php marketplace-product-sync.php
+          sha256sum dist/woocommerce-multi-source-product-sync-1.4.4.zip > dist/SHA256SUMS.txt
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - name: Finalize source and remove temporary upload payload
+        if: steps.package.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .release-payload
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A .release-payload marketplace-product-sync.php
+          git commit -m "Finalize plugin source v1.4.4"
+          git push origin HEAD:main
+      - name: Publish GitHub Release
+        if: steps.package.outputs.ready == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.4.4
+          target_commitish: main
+          name: "WooCommerce Multi-Source Product Sync v1.4.4"
+          body_path: RELEASE_NOTES.md
+          files: |
+            dist/woocommerce-multi-source-product-sync-1.4.4.zip
+            dist/SHA256SUMS.txt
+          token: ${{ secrets.GITHUB_TOKEN }}
+          make_latest: true
+          prerelease: false
