@@ -1,0 +1,265 @@
+gnal
+            // over guessing from the destination taxonomy name, which may exist
+            // even when the source attribute is local/custom.
+            if (array_key_exists('id', $item)) {
+                $is_global = absint($item['id']) > 0 && $taxonomy && taxonomy_exists($taxonomy);
+            } elseif (isset($item['is_taxonomy'])) {
+                $is_global = $this->to_bool($item['is_taxonomy']) && $taxonomy && taxonomy_exists($taxonomy);
+            } else {
+                $is_global = $taxonomy && taxonomy_exists($taxonomy);
+            }
+            $attribute = new WC_Product_Attribute();
+            if ($is_global) {
+                $attribute_id = function_exists('wc_attribute_taxonomy_id_by_name') ? absint(wc_attribute_taxonomy_id_by_name($taxonomy)) : 0;
+                if ($attribute_id) {
+                    $attribute->set_id($attribute_id);
+                }
+                $attribute->set_name($taxonomy);
+                $option_names = $this->normalize_terms(isset($item['options']) ? $item['options'] : array());
+                $option_ids = array();
+                foreach ($option_names as $option_name) {
+                    $term = term_exists($option_name, $taxonomy);
+                    if (!$term) {
+                        $created = wp_insert_term($option_name, $taxonomy);
+                        if (!is_wp_error($created)) {
+                            $term = $created;
+                        }
+                    }
+                    if (is_array($term) && !empty($term['term_id'])) {
+                        $option_ids[] = absint($term['term_id']);
+                    } elseif (is_numeric($term)) {
+                        $option_ids[] = absint($term);
+                    }
+                }
+                $attribute->set_options($option_ids);
+            } else {
+                $attribute->set_name($name);
+                $attribute->set_options($this->normalize_terms(isset($item['options']) ? $item['options'] : array()));
+            }
+            $attribute->set_position(isset($item['position']) ? absint($item['position']) : absint($position));
+            $attribute->set_visible(isset($item['visible']) ? $this->to_bool($item['visible']) : true);
+            $attribute->set_variation(isset($item['variation']) ? $this->to_bool($item['variation']) : false);
+            $attributes[] = $attribute;
+        }
+        return $attributes;
+    }
+
+    private function build_attributes_from_specs($specs) {
+        $items = array();
+        foreach ($specs as $name => $spec) {
+            if ('' === trim((string) $name)) {
+                continue;
+            }
+            $data = array(
+                'name' => $name,
+                'options' => isset($spec['options']) ? $spec['options'] : array(),
+                'position' => isset($spec['position']) ? absint($spec['position']) : count($items),
+                'visible' => isset($spec['visible']) ? $this->to_bool($spec['visible']) : true,
+                'variation' => isset($spec['variation']) ? $this->to_bool($spec['variation']) : false,
+                'is_taxonomy' => isset($spec['is_taxonomy']) ? $this->to_bool($spec['is_taxonomy']) : null,
+            );
+            if (null === $data['is_taxonomy']) {
+                unset($data['is_taxonomy']);
+            }
+            $items[] = $data;
+        }
+        return $this->normalize_product_attributes($items);
+    }
+
+    private function normalize_downloads($value, $source_id, $remote_id) {
+        if (!is_array($value) || !class_exists('WC_Product_Download')) {
+            return array();
+        }
+        $downloads = array();
+        foreach ($value as $index => $item) {
+            if (is_string($item)) {
+                $item = array('file' => $item, 'name' => basename((string) parse_url($item, PHP_URL_PATH)));
+            }
+            if (!is_array($item)) {
+                continue;
+            }
+            $file = isset($item['file']) ? esc_url_raw($item['file']) : (isset($item['url']) ? esc_url_raw($item['url']) : '');
+            if ('' === $file) {
+                continue;
+            }
+            $download = new WC_Product_Download();
+            $download->set_id(md5($source_id . '|' . $remote_id . '|download|' . $index . '|' . $file));
+            $download->set_name(isset($item['name']) ? sanitize_text_field($item['name']) : basename((string) parse_url($file, PHP_URL_PATH)));
+            $download->set_file($file);
+            if (isset($item['file'])) {
+                $downloads[] = $download;
+            }
+        }
+        return $downloads;
+    }
+
+    private function resolve_remote_product_references($source_id, $value, $single = false) {
+        $refs = is_array($value) ? $value : array($value);
+        $local_ids = array();
+        foreach ($refs as $ref) {
+            if (is_array($ref)) {
+                $ref = isset($ref['id']) ? $ref['id'] : (isset($ref['remote_id']) ? $ref['remote_id'] : '');
+            }
+            if (!is_scalar($ref) || '' === trim((string) $ref)) {
+                continue;
+            }
+            $local_id = $this->find_imported_product((string) $source_id, (string) absint($ref));
+            if ($local_id) {
+                $local_ids[] = absint($local_id);
+            }
+        }
+        $local_ids = array_values(array_unique($local_ids));
+        if ($single) {
+            return $local_ids ? $local_ids[0] : null;
+        }
+        return $local_ids;
+    }
+
+    /**
+     * Find an existing product imported before this plugin was installed.
+     * Matching order: exact SKU, exact global unique ID, exact slug, then a unique exact title.
+     * Variations are matched by SKU or by their attribute combination under the matched parent.
+     * Products already managed by a different source are never adopted.
+     */
+    private function find_legacy_imported_product($source_id, $remote, $remote_type, $variation_context = null) {
+        $source_id = (string) $source_id;
+        $remote_type = (string) $remote_type;
+        $post_type = 'variation' === $remote_type ? 'product_variation' : 'product';
+        $statuses = array('publish', 'pending', 'draft', 'private', 'future');
+
+        $sku = isset($remote['sku']) && is_scalar($remote['sku']) ? trim((string) $remote['sku']) : '';
+        if ('' !== $sku && function_exists('wc_get_product_id_by_sku')) {
+            $id = absint(wc_get_product_id_by_sku($sku));
+            if ($id && $this->legacy_candidate_is_eligible($id, $source_id, $remote_type, $variation_context)) {
+                return array('id' => $id, 'method' => 'SKU');
+            }
+        }
+
+        $global_unique_id = isset($remote['global_unique_id']) && is_scalar($remote['global_unique_id'])
+            ? trim((string) $remote['global_unique_id']) : '';
+        if ('' !== $global_unique_id) {
+            $ids = get_posts(array(
+                'post_type' => $post_type,
+                'post_status' => $statuses,
+                'fields' => 'ids',
+                'posts_per_page' => 20,
+                'orderby' => 'ID',
+                'order' => 'ASC',
+                'meta_key' => '_global_unique_id',
+                'meta_value' => $global_unique_id,
+                'suppress_filters' => true,
+            ));
+            $match = $this->choose_legacy_candidate($ids, $source_id, $remote_type, $variation_context);
+            if (!empty($match['id']) || !empty($match['ambiguous'])) {
+                $match['method'] = 'شناسه جهانی کالا (GTIN/UPC/EAN/ISBN)';
+                return $match;
+            }
+        }
+
+        if ('variation' === $remote_type && is_array($variation_context) && !empty($variation_context['parent_local_id'])) {
+            $remote_attributes = isset($remote['attributes']) && is_array($remote['attributes'])
+                ? $this->normalize_variation_attributes($remote['attributes']) : array();
+            $remote_signature = $this->legacy_variation_signature($remote_attributes);
+            if ('' !== $remote_signature) {
+                $ids = get_posts(array(
+                    'post_type' => 'product_variation',
+                    'post_status' => $statuses,
+                    'post_parent' => absint($variation_context['parent_local_id']),
+                    'fields' => 'ids',
+                    'posts_per_page' => -1,
+                    'orderby' => 'ID',
+                    'order' => 'ASC',
+                    'suppress_filters' => true,
+                ));
+                $matching_ids = array();
+                foreach ($ids as $id) {
+                    $id = absint($id);
+                    if (!$this->legacy_candidate_is_eligible($id, $source_id, $remote_type, $variation_context)) {
+                        continue;
+                    }
+                    $candidate = wc_get_product($id);
+                    if ($candidate && $remote_signature === $this->legacy_variation_signature($candidate->get_attributes())) {
+                        $matching_ids[] = $id;
+                    }
+                }
+                if (1 === count($matching_ids)) {
+                    return array('id' => $matching_ids[0], 'method' => 'ترکیب ویژگی‌های وارییشن زیر محصول والد');
+                }
+                if (count($matching_ids) > 1) {
+                    return array('id' => 0, 'ambiguous' => true, 'method' => 'ویژگی‌های وارییشن');
+                }
+            }
+            // Variation titles/slugs are not reliable identifiers; do not guess when SKU/attributes fail.
+            return array('id' => 0, 'ambiguous' => false);
+        }
+
+        $slug = isset($remote['slug']) && is_scalar($remote['slug']) ? sanitize_title((string) $remote['slug']) : '';
+        if ('' !== $slug) {
+            $ids = get_posts(array(
+                'post_type' => 'product',
+                'post_status' => $statuses,
+                'fields' => 'ids',
+                'posts_per_page' => 30,
+                'orderby' => 'ID',
+                'order' => 'ASC',
+                'name' => $slug,
+                'suppress_filters' => true,
+            ));
+            $match = $this->choose_legacy_candidate($ids, $source_id, $remote_type, null);
+            if (!empty($match['id']) || !empty($match['ambiguous'])) {
+                $match['method'] = 'نامک (slug)';
+                return $match;
+            }
+        }
+
+        $title = isset($remote['name']) && is_scalar($remote['name']) ? trim(wp_strip_all_tags((string) $remote['name'])) : '';
+        if ('' !== $title) {
+            $ids = get_posts(array(
+                'post_type' => 'product',
+                'post_status' => $statuses,
+                'fields' => 'ids',
+                'posts_per_page' => 50,
+                'orderby' => 'ID',
+                'order' => 'ASC',
+                'title' => $title,
+                'suppress_filters' => true,
+            ));
+            $match = $this->choose_legacy_candidate($ids, $source_id, $remote_type, null);
+            if (!empty($match['id']) || !empty($match['ambiguous'])) {
+                $match['method'] = 'نام دقیق و یکتای محصول';
+                return $match;
+            }
+        }
+
+        return array('id' => 0, 'ambiguous' => false);
+    }
+
+    private function choose_legacy_candidate($ids, $source_id, $remote_type, $variation_context = null) {
+        $eligible = array();
+        foreach ((array) $ids as $id) {
+            $id = absint($id);
+            if ($id && $this->legacy_candidate_is_eligible($id, $source_id, $remote_type, $variation_context)) {
+                $eligible[] = $id;
+            }
+        }
+        $eligible = array_values(array_unique($eligible));
+        if (1 === count($eligible)) {
+            return array('id' => $eligible[0], 'ambiguous' => false);
+        }
+        if (count($eligible) > 1) {
+            return array('id' => 0, 'ambiguous' => true);
+        }
+        return array('id' => 0, 'ambiguous' => false);
+    }
+
+    private function legacy_candidate_is_eligible($product_id, $source_id, $remote_type, $variation_context = null) {
+        $owner_source = get_post_meta($product_id, '_mpsync_source_id', true);
+        if ('' !== (string) $owner_source && (string) $owner_source !== (string) $source_id) {
+            return false;
+        }
+        $product = wc_get_product($product_id);
+        if (!$product || (string) $product->get_type() !== (string) $remote_type) {
+            return false;
+        }
+        if ('variation' === $remote_type && is_array($variation_context) && !empty($variation_context['parent_local_id'])) {
+            if ((int) $product->get_parent_id() !== (in
