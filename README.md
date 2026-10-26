@@ -1,11 +1,14 @@
 # همگام‌ساز چندمنبعی محصولات ووکامرس | WooCommerce Multi-Source Product Sync
 
+![کاور همگام‌ساز چندمنبعی محصولات ووکامرس](assets/cover.svg)
+
 **نسخه:** 1.4.4 · **ناشر:** Toranide · **مجوز:** GPL-2.0-or-later
 
 افزونه‌ای رایگان برای واردکردن و همگام‌سازی محصولات از چند فروشگاه مبدأ که **WooCommerce REST API** را ارائه می‌کنند. برای هر منبع می‌توان نگاشت فیلدهای مستقل، مقادیر ثابت و پیش‌فرض، ضریب قیمت، اجرای دستی و زمان‌بندی جداگانه تنظیم کرد.
 
 > صفحه معرفی پروژه: https://toranide.github.io/woocommerce-multi-source-product-sync-demo/  
-> این صفحه معرفی است و یک دموی زنده وردپرس نیست.
+> این صفحه معرفی است و یک دموی زنده وردپرس نیست.  
+> **دریافت نسخه نصب و Releaseها:** [صفحه انتشارها](https://github.com/Toranide/woocommerce-multi-source-product-sync-demo/releases).
 
 ## امکانات
 
