@@ -1,0 +1,207 @@
+           if (401 === $status || 403 === $status) {
+                $message .= ' دسترسی و مجوز Read کلیدهای API را بررسی کنید.';
+            }
+            return new WP_Error('mpsync_api_http_' . $status, $message);
+        }
+        if (!is_array($decoded)) {
+            return new WP_Error('mpsync_bad_json', 'پاسخ API JSON معتبر نیست.');
+        }
+        // A product list is a numerically indexed array; WordPress REST error objects are associative.
+        if (isset($decoded['code']) && isset($decoded['message'])) {
+            return new WP_Error('mpsync_api_error', sanitize_text_field($decoded['message']));
+        }
+        if (array() !== $decoded && array_keys($decoded) !== range(0, count($decoded) - 1)) {
+            return new WP_Error('mpsync_unexpected_response', 'ساختار پاسخ API فهرست محصولات ووکامرس نیست. مسیر API محصولات را بررسی کنید.');
+        }
+        $total_pages = (int) wp_remote_retrieve_header($response, 'x-wp-totalpages');
+        $total_items = (int) wp_remote_retrieve_header($response, 'x-wp-total');
+        return array('products' => $decoded, 'total_pages' => $total_pages, 'total_items' => $total_items);
+    }
+
+    private function import_product($source, $remote, $sync_variations = false, $variation_context = null) {
+        $remote_type = is_array($variation_context) ? 'variation' : (isset($remote['type']) ? sanitize_key($remote['type']) : 'simple');
+        $product_classes = array(
+            'simple' => 'WC_Product_Simple',
+            'variable' => 'WC_Product_Variable',
+            'variation' => 'WC_Product_Variation',
+            'external' => 'WC_Product_External',
+            'grouped' => 'WC_Product_Grouped',
+        );
+        if (!isset($product_classes[$remote_type]) || !class_exists($product_classes[$remote_type])) {
+            $this->add_log(isset($source['id']) ? $source['id'] : '', 'warning', 'محصول مبدأ #' . (isset($remote['id']) ? absint($remote['id']) : 'نامشخص') . ' با نوع «' . sanitize_text_field($remote_type) . '» پشتیبانی نمی‌شود و رد شد.');
+            return 'skipped';
+        }
+        $remote_api_id = (string) absint($remote['id']);
+        $remote_id = is_array($variation_context) ? 'variation:' . $remote_api_id : $remote_api_id;
+        $source_id = (string) $source['id'];
+        $existing_id = $this->find_imported_product($source_id, $remote_id);
+        $legacy_match_method = '';
+        if (!$existing_id) {
+            // Adopt products that were previously imported with WooCommerce's CSV importer.
+            // Their local IDs differ from the source IDs and they do not yet have our tracking metadata.
+            $legacy_match = $this->find_legacy_imported_product($source_id, $remote, $remote_type, $variation_context);
+            if (!empty($legacy_match['ambiguous'])) {
+                $name = isset($remote['name']) ? sanitize_text_field((string) $remote['name']) : ('#' . $remote_api_id);
+                $this->add_log($source_id, 'warning', 'محصول «' . $name . '» به دلیل وجود چند محصول قدیمی مشابه به‌صورت خودکار به‌روزرسانی نشد؛ برای جلوگیری از اتصال اشتباه یا تکراری‌سازی، شناسه/SKU یا نامک را بررسی کنید.');
+                return 'skipped';
+            }
+            if (!empty($legacy_match['id'])) {
+                $existing_id = absint($legacy_match['id']);
+                $legacy_match_method = isset($legacy_match['method']) ? (string) $legacy_match['method'] : 'legacy';
+                $this->add_log($source_id, 'info', 'محصول قدیمی مقصد #' . $existing_id . ' با روش «' . $legacy_match_method . '» به محصول مبدأ #' . $remote_api_id . ' متصل شد و به‌روزرسانی می‌شود.');
+            }
+        }
+        $product_class = $product_classes[$remote_type];
+        $product = $existing_id ? wc_get_product($existing_id) : new $product_class();
+        if (!$product) {
+            return new WP_Error('mpsync_product_load', 'محصول مقصد موجود قابل بارگذاری نیست.');
+        }
+        if ($existing_id && get_class($product) !== $product_class && !is_a($product, $product_class)) {
+            return new WP_Error('mpsync_product_type', 'نوع محصول مبدأ با نوع محصول قبلاً واردشده فرق دارد؛ برای جلوگیری از خرابی، نوع محصول خودکار عوض نشد.');
+        }
+
+        $mapping = isset($source['mapping']) && is_array($source['mapping']) ? $source['mapping'] : $this->default_mapping();
+        $mapped = array();
+        $custom_meta = array();
+        $taxonomy_values = array();
+        $attribute_specs = array();
+        $attribute_defaults = array();
+        $variation_attribute_values = array();
+        $image_override = null;
+        $allowed = $this->supported_product_fields();
+
+        foreach ($mapping as $row) {
+            if (!is_array($row) || empty($row['target'])) {
+                continue;
+            }
+            $target = trim((string) $row['target']);
+            $mode = isset($row['mode']) ? $row['mode'] : 'source';
+            $path = isset($row['source']) ? trim((string) $row['source']) : '';
+            $default = isset($row['value']) ? $row['value'] : '';
+            $found = false;
+            $value = null;
+            if ('static' !== $mode && '' !== $path) {
+                $value = $this->get_path_value($remote, $path, $found);
+            }
+            if ('static' === $mode) {
+                $found = true;
+                $value = $default;
+            } elseif ('fallback' === $mode && (!$found || '' === $value || null === $value || (is_array($value) && empty($value)))) {
+                $found = true;
+                $value = $default;
+            }
+            if (!$found) {
+                continue;
+            }
+            if (0 === strpos($target, 'meta:')) {
+                $key = sanitize_key(substr($target, 5));
+                if ('' !== $key) {
+                    $custom_meta[$key] = $value;
+                }
+            } elseif (0 === strpos($target, 'taxonomy:')) {
+                $taxonomy = sanitize_key(substr($target, 9));
+                if ('' !== $taxonomy) {
+                    $taxonomy_values[$taxonomy] = $this->normalize_terms($value);
+                }
+            } elseif ('images' === $target) {
+                $image_override = $value;
+            } elseif ('attributes' === $target) {
+                $mapped['attributes'] = is_array($variation_context)
+                    ? $this->normalize_variation_attributes($value)
+                    : $this->normalize_product_attributes($value);
+            } elseif ('default_attributes' === $target && !is_array($variation_context)) {
+                $mapped['default_attributes'] = $this->normalize_default_attributes($value);
+            } elseif (preg_match('/^attribute:([^:]+)$/i', $target, $attribute_match)) {
+                $attribute_name = trim($attribute_match[1]);
+                if ('' !== $attribute_name) {
+                    if (is_array($variation_context)) {
+                        $terms = $this->normalize_terms($value);
+                        $variation_attribute_values[$attribute_name] = $terms ? $terms[0] : (is_scalar($value) ? (string) $value : '');
+                    } else {
+                        $attribute_specs[$attribute_name]['options'] = $this->normalize_terms($value);
+                    }
+                }
+            } elseif (preg_match('/^attribute_default:([^:]+)$/i', $target, $attribute_match)) {
+                $attribute_defaults[trim($attribute_match[1])] = is_scalar($value) ? (string) $value : '';
+            } elseif (preg_match('/^attribute_data:([^:]+)$/i', $target, $attribute_match)) {
+                $attribute_name = trim($attribute_match[1]);
+                if (is_array($value)) {
+                    $attribute_specs[$attribute_name] = array_merge(isset($attribute_specs[$attribute_name]) ? $attribute_specs[$attribute_name] : array(), $value);
+                } elseif (is_scalar($value)) {
+                    $bits = array_map('trim', explode('|', (string) $value));
+                    $attribute_specs[$attribute_name]['position'] = isset($bits[0]) ? absint($bits[0]) : 0;
+                    $attribute_specs[$attribute_name]['visible'] = isset($bits[1]) ? $this->to_bool($bits[1]) : true;
+                    $attribute_specs[$attribute_name]['variation'] = isset($bits[2]) ? $this->to_bool($bits[2]) : false;
+                    if (isset($bits[3]) && '' !== $bits[3]) {
+                        $attribute_specs[$attribute_name]['is_taxonomy'] = $this->to_bool($bits[3]);
+                    }
+                }
+            } elseif ('shipping_class' === $target) {
+                $taxonomy_values['product_shipping_class'] = $this->normalize_terms($value);
+            } elseif (in_array($target, array('upsell_ids', 'cross_sell_ids', 'children', 'parent_id'), true)) {
+                $mapped[$target] = $value; // resolved to destination IDs below; source IDs are never copied as destination IDs.
+            } elseif (in_array($target, $allowed, true)) {
+                $mapped[$target] = $value;
+            }
+        }
+
+        if (is_array($variation_context) && $variation_attribute_values) {
+            $explicit_variation_values = $this->normalize_variation_attributes_from_map($variation_attribute_values);
+            $mapped['attributes'] = array_merge(isset($mapped['attributes']) && is_array($mapped['attributes']) ? $mapped['attributes'] : array(), $explicit_variation_values);
+        }
+        if ($attribute_specs) {
+            $extra_attributes = $this->build_attributes_from_specs($attribute_specs);
+            if (isset($mapped['attributes']) && is_array($mapped['attributes'])) {
+                $existing_attrs = array();
+                foreach ($mapped['attributes'] as $attr) {
+                    if ($attr instanceof WC_Product_Attribute) {
+                        $existing_attrs[strtolower($attr->get_name())] = $attr;
+                    }
+                }
+                foreach ($extra_attributes as $attr) {
+                    $existing_attrs[strtolower($attr->get_name())] = $attr;
+                }
+                $mapped['attributes'] = array_values($existing_attrs);
+            } else {
+                $mapped['attributes'] = $extra_attributes;
+            }
+        }
+        if ($attribute_defaults && !is_array($variation_context)) {
+            $mapped['default_attributes'] = array_merge(
+                isset($mapped['default_attributes']) && is_array($mapped['default_attributes']) ? $mapped['default_attributes'] : array(),
+                $this->normalize_default_attributes($attribute_defaults)
+            );
+        }
+        foreach (array('upsell_ids', 'cross_sell_ids', 'children', 'parent_id') as $relation_field) {
+            if (array_key_exists($relation_field, $mapped)) {
+                $mapped[$relation_field] = $this->resolve_remote_product_references($source_id, $mapped[$relation_field], 'parent_id' === $relation_field);
+                if (null === $mapped[$relation_field]) {
+                    unset($mapped[$relation_field]);
+                }
+            }
+        }
+        if (is_array($variation_context)) {
+            $mapped['parent_id'] = absint($variation_context['parent_local_id']);
+        }
+
+        $price_multiplier = isset($source['price_multiplier']) && is_numeric($source['price_multiplier'])
+            ? (float) $source['price_multiplier'] : 1.0;
+        $price_multiplier = max(0.01, min(100.0, $price_multiplier));
+        if (1.0 !== $price_multiplier) {
+            foreach (array('regular_price', 'sale_price') as $price_field) {
+                if (isset($mapped[$price_field]) && is_scalar($mapped[$price_field]) && '' !== (string) $mapped[$price_field] && is_numeric($mapped[$price_field])) {
+                    $mapped[$price_field] = wc_format_decimal((float) $mapped[$price_field] * $price_multiplier, wc_get_price_decimals());
+                }
+            }
+        }
+
+        if ('variation' !== $remote_type && (empty($mapped['name']) || !is_scalar($mapped['name']) || '' === trim((string) $mapped['name']))) {
+            return new WP_Error('mpsync_missing_name', 'نگاشت فیلد name مقدار معتبر ندارد؛ برای محصول نام الزامی است.');
+        }
+        if (isset($mapped['status']) && !in_array($mapped['status'], array('publish', 'draft', 'pending', 'private'), true)) {
+            $mapped['status'] = 'publish';
+        }
+        if (isset($mapped['stock_status']) && !in_array($mapped['stock_status'], array('instock', 'outofstock', 'onbackorder'), true)) {
+            unset($mapped['stock_status']);
+        }
+        if (isset($mapped['catalog_visibility']) && !in_array($mapped['catalog_visibility'], array('visible', 'ca
